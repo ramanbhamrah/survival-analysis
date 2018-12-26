@@ -1,0 +1,278 @@
+####################  1st Approach  #######################
+median_surv_time<- function(data, coxph.fit, km.fit){
+  pred<-survfit(coxph.fit, newdata = data[,])
+  median<-data.frame(pred=as.numeric())
+  
+  for(i in 1:nrow(data)){
+    median[i,1]<-min(pred$time[which(pred$surv[,i]==
+                                       max(subset(pred$surv[,i],pred$surv[,i]<=0.5)))])
+  }
+  median[1][median[1] == Inf] <- km.fit$time[max(which(km.fit$surv >= 0.49))]
+  MD<-as.data.frame(median)
+  return(MD)
+}
+min_max_scale <- function(data,columns_vec){
+  col_index =which(colnames(data) %in% columns_vec);
+  for(i in col_index){
+    data[,i] <- (data[,i] - min(data[,i]))/(max(data[,i])- min(data[,i]));
+  }
+  return(data)
+}
+
+num_only_data<-function(df,regressand){
+  #Find character columns and remove them
+  nums <- sapply(df, is.character)
+  df<-df[,-which(nums==TRUE)]
+  
+  #Find date columns and remove them
+  library(lubridate)
+  dates <-sapply(df, is.Date)
+  df<-df[,which(dates==FALSE)]#df <- df[, -which(dates == T)]
+  
+  df<-df[,-(which(colnames(df)==regressand))]
+  return(df)
+}
+
+multicollinearity <- function(df){
+  ls1 <- names(df);
+  library(usdm);
+  ls2<- vifstep(df,th = 10)@excluded
+  #ls2<- vifcor(df,th = .9)@excluded
+  var <-ls1[!ls1 %in% ls2]
+  return(var)
+}
+
+expectedLifeTime<- function(traindata,testdata,surv_objects,trans_id){
+  
+  #source("~/git/AUTOMATION/Rcode/new/data_manip.R")
+  num_data<- Filter(is.numeric, traindata)
+  
+  num_data<- num_data[, !(colnames(num_data) %in% surv_objects)]
+  
+  #Finding correlated variables above .75 correlation  coeficient
+  cor_mat<-cor(num_data)
+  library(caret)
+  rm_id<-findCorrelation(cor_mat, cutoff = 0.75, verbose = FALSE, names = FALSE,
+                         exact = ncol(cor_mat) < 100)
+  
+  num_data<-num_data[, -rm_id]
+  #Finding correlated variables above 10 VIF !!!!!!!!!!!!!!! should be <= 5
+  cols<-multicollinearity(num_data)
+  
+  #Making final data set
+  traindata<- traindata[,which(colnames(traindata)%in% c(cols,surv_objects,trans_id))]
+  
+  #Finding variables to use in model
+  vars<-setdiff(names(traindata), trans_id) #a<-which(colnames(data) %in% trans_id)
+  
+  #Transform variables by min max normalisation
+  cols_trans<- names(which(sapply(Filter(is.numeric, traindata), min) != 0 |
+                             sapply(Filter(is.numeric, traindata), max) != 1))
+  
+  #source("~/git/AUTOMATION/Rcode/new/data_manip.R")
+  traindata<-min_max_scale(traindata, setdiff(cols_trans, surv_objects))
+  
+  #CoxPH Survival Model
+  surv_objects_comb<-paste0("Surv(", surv_objects[1],",",surv_objects[2], ")")
+  form1<-formula(paste(surv_objects_comb,"~."))
+  form2<-formula(paste(surv_objects_comb,"~1")) 
+  library(survival)
+  coxph.fit<-coxph(form, data= traindata[vars], method= "breslow")
+  km.fit <- survfit(form2,type="kaplan-meier",data = traindata)
+  
+  MST<-list()
+  
+  #data<- data[setdiff(vars, surv_objects)]
+  #source("../RCode/new/ltv_functions.R")
+  m<-1
+  for( i in 1:ceiling(nrow(testdata)/10000)){
+    
+    n<-ifelse(i==ceiling(nrow(testdata)/10000),nrow(testdata),i*10000)
+    MST[[i]]<-median_surv_time(testdata[m:n,],coxph.fit,km.fit)
+    m<-n+1
+    print(i)
+  }
+  MD<-do.call(rbind, MST)
+  MD$median_time<-as.numeric(as.character(MD$median_time))
+  
+  return(MD)
+}
+
+####################  2nd Approach  ########################
+row_outlier_det <- function(data){
+  library(MASS)
+  #Outlier detection for training data :
+  outlier.statistics<-cbind(c(1:nrow(data)),
+                            studres(lm(age ~ . -canonical_id -censoredFlag, data = data)),
+                            hatvalues(lm(age ~ . -canonical_id -censoredFlag,data = data)))
+  
+  outliers1 <- outlier.statistics[abs(outlier.statistics[,2])>3,]
+  
+  outliers2 <- outlier.statistics[abs(outlier.statistics[,2])<3,]
+  
+  outliers2 <- outliers2[abs(outliers2[,2])>2,]
+  
+  outliers2 <- outliers2[abs(outliers2[,3])>
+                           2*(ncol(data)-3)/nrow(data),]
+  
+  outliers <- data.frame(rbind(outliers1,outliers2))
+  
+  abc <- sort(as.numeric(as.character(rownames(outliers))))
+  
+  return(abc)
+}
+
+min_max_scaling <- function(data,columns_vec){
+  col_index =which(colnames(data) %in% columns_vec);
+  for(i in col_index){
+    data[,i] <- (data[,i] - min(data[,i]))/(max(data[,i])- min(data[,i]));
+  }
+  return(data)
+}
+
+median_survival_function <- function(data, coxph.fit){
+  # Making sequence time for the data
+  seq_t <- seq(range(data$age)[1], range(data$age)[2], length.out = 2000)
+  pred_cox <- predictSurvProb(coxph.fit, data, seq_t)
+  pred_cox <- as.data.frame(round(cbind(seq_t, t(pred_cox)), 4))
+  
+  for(i in 2:dim(pred_cox)[2] ){
+    temp <- round(pred_cox$seq_t[which.max(pred_cox[i] < 0.5)], 0)
+    median_time <- c(median_time,temp)
+  }
+  return(median_time)
+}
+
+coxph_modelling_1<- function(traindata, testdata, surv_objects){
+  
+  #Outlier detection using leverages and studentized residuals
+  rows_to_del <- row_outlier_det(traindata)
+  traindata <- traindata[-rows_to_del,]
+  
+  #Taking those covariates after applying stepwise selection:
+  traindata <- traindata[, covariates]
+  testdata <- testdata[, covariates]
+  #Transform variables by min max normalisation
+  cols_trans<- names(which(sapply(Filter(is.numeric, traindata), min) != 0 |
+                             sapply(Filter(is.numeric, traindata), max) != 1))
+  
+  #Min - Max scaling
+  traindata<-min_max_scaling(traindata, setdiff(cols_trans, surv_objects))
+  testdata <- min_max_scaling(testdata, setdiff(cols_trans, surv_objects))
+  
+  #CoxPH Survival Model
+  surv_objects_comb<-paste0("Surv(", surv_objects[1],",",surv_objects[2], ")")
+  form<-formula(paste(surv_objects_comb,"~."))
+  coxph.fit<-coxph(form, data= traindata[covariates])
+  median_time <- c()
+  prediction <- c()
+  m<-1
+  for( i in 1:ceiling(nrow(testdata)/10000)){
+    n<-ifelse(i==ceiling(nrow(testdata)/10000),nrow(testdata),i*10000)
+    x<-median_survival_function(testdata[m:n,],coxph.fit)
+    prediction <- c(prediction,x)
+    m<-n+1
+    print(i)
+  }
+  return(prediction)
+}
+
+#################  EXPLICIT APPROACH  ######################
+row_outlier_det <- function(data){
+  library(MASS)
+  #Outlier detection for training data :
+  outlier.statistics<-cbind(c(1:nrow(data)),
+                            studres(lm(age ~ . -canonical_id -censoredFlag, data = data)),
+                            hatvalues(lm(age ~ . -canonical_id -censoredFlag,data = data)))
+  
+  outliers1 <- outlier.statistics[abs(outlier.statistics[,2])>3,]
+  
+  outliers2 <- outlier.statistics[abs(outlier.statistics[,2])<3,]
+  
+  outliers2 <- outliers2[abs(outliers2[,2])>2,]
+  
+  outliers2 <- outliers2[abs(outliers2[,3])>
+                           2*(ncol(data)-3)/nrow(data),]
+  
+  outliers <- data.frame(rbind(outliers1,outliers2))
+  
+  abc <- sort(as.numeric(as.character(rownames(outliers))))
+  
+  return(abc)
+}
+
+min_max_scaling <- function(data,columns_vec){
+  col_index =which(colnames(data) %in% columns_vec);
+  for(i in col_index){
+    data[,i] <- (data[,i] - min(data[,i]))/(max(data[,i])- min(data[,i]));
+  }
+  return(data)
+}
+
+Explicit_approach <- function(data, coxph.fit){
+  #baseline hazard :
+  base <- basehaz(coxph.fit)
+  
+  #Beta's for each covariate :
+  beta<- as.matrix(coxph.fit$coefficients)
+  
+  #Save significant variable 
+  coef<- names(summary(coxph.fit)$coef[,5]<0.05)
+  
+  #actual values of covariates in data :
+  covar <- as.matrix(data[,coef])
+  
+  exp_covar.beta <- as.data.frame(exp(covar %*% beta))
+  final_hazard <- matrix(0,nrow = nrow(base), ncol = nrow(data))
+  survival_prob <- matrix(0,nrow = nrow(base), ncol = nrow(data))
+  for(i in 1:nrow(data)){
+    for(j in 1:nrow(base)){
+      final_hazard[j,i] <- exp_covar.beta[i,1]*base$hazard[j]
+    }
+  }
+  
+  for(i in 1:nrow(data)){
+    survival_prob[,i] <- exp(-cumsum(final_hazard[,i]))
+  }
+  
+  survival_prob <- as.data.frame(survival_prob)
+  median_time <- matrix(0,nrow = nrow(data))
+  for(i in 1:dim(survival_prob)[2]){
+    median_time[i,1]<- as.numeric(as.character(rownames(survival_prob)[which.max(survival_prob[i] < 0.5)]))
+  }
+  return(median_time)
+}
+
+coxph_modelling_2<- function(traindata, testdata, surv_objects){
+  
+  #Outlier detection using leverages and studentized residuals
+  rows_to_del <- row_outlier_det(traindata)
+  traindata <- traindata[-rows_to_del,]
+  
+  #Taking those covariates after applying stepwise selection:
+  traindata <- traindata[, covariates]
+  testdata <- testdata[, covariates]
+  #Transform variables by min max normalisation
+  cols_trans<- names(which(sapply(Filter(is.numeric, traindata), min) != 0 |
+                             sapply(Filter(is.numeric, traindata), max) != 1))
+  
+  #source("~/git/AUTOMATION/Rcode/new/data_manip.R")
+  traindata<-min_max_scaling(traindata, setdiff(cols_trans, surv_objects))
+  testdata <- min_max_scaling(testdata, setdiff(cols_trans, surv_objects))
+  
+  #CoxPH Survival Model
+  surv_objects_comb<-paste0("Surv(", surv_objects[1],",",surv_objects[2], ")")
+  form<-formula(paste(surv_objects_comb,"~."))
+  coxph.fit<-coxph(form, data= traindata[covariates])
+  median_time <- c()
+  prediction <- c()
+  m<-1
+  for( i in 1:ceiling(nrow(testdata)/100)){
+    n<-ifelse(i==ceiling(nrow(testdata)/100),nrow(testdata),i*100)
+    x<-Explicit_approach(testdata[m:n,],coxph.fit)
+    prediction <- c(prediction,x)
+    m<-n+1
+    print(i)
+  }
+  return(prediction)
+}
